@@ -100,8 +100,15 @@ def _drop_incomplete(obj):
     return obj
 
 
+DATA_YEARS = 12      # 내려받는 총 기간 (백테스트 최대 10년 + 지표 계산용 여유 2년)
+
+
+def _start_str():
+    return (pd.Timestamp.today() - pd.DateOffset(years=DATA_YEARS)).strftime("%Y-%m-%d")
+
+
 def _close_series(symbol):
-    d = yf.download(symbol, period="5y", auto_adjust=True, progress=False)
+    d = yf.download(symbol, start=_start_str(), auto_adjust=True, progress=False)
     if isinstance(d.columns, pd.MultiIndex):
         d.columns = d.columns.get_level_values(0)
     s = d["Close"].dropna()
@@ -111,7 +118,7 @@ def _close_series(symbol):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_data():
-    raw = yf.download(TICKERS, period="5y", group_by="ticker", auto_adjust=True,
+    raw = yf.download(TICKERS, start=_start_str(), group_by="ticker", auto_adjust=True,
                       progress=False, threads=True)
     stocks = {}
     for t in TICKERS:
@@ -128,6 +135,7 @@ def load_data():
         "gspc": _close_series("^GSPC"),
         "vix": _close_series("^VIX"),
         "tnx": _close_series("^TNX"),
+        "spy": _close_series("SPY"),     # 벤치마크: S&P500 ETF (배당 포함 조정가)
     }
 
 
@@ -308,12 +316,48 @@ def simulate_trade(d, i, p):
     }
 
 
+def portfolio_curve(trades, stocks, bench, start, end, p):
+    """거래 목록 -> 일별 포트폴리오 수익 곡선. 한 종목에 자금의 1/max_pos를 배정, 남는 자금은 현금(수익 0%)."""
+    days = bench.loc[start:end].index
+    slot = 1.0 / p["max_pos"]
+    fee = p["fee"] / 100
+    daily = pd.Series(0.0, index=days)
+    expo = pd.Series(0.0, index=days)
+    for _, t in trades.iterrows():
+        df = stocks[t["ticker"]]
+        is_open = t["reason"] == "보유중"
+        x = df.index[-1] if is_open else t["exit_date"]
+        seg = df.loc[t["entry_date"]:x, "Close"]
+        if len(seg) == 0:
+            continue
+        prev = seg.shift(1)
+        prev.iloc[0] = t["entry"]
+        r = seg / prev - 1
+        if not is_open:
+            r.iloc[-1] = t["exit"] / prev.iloc[-1] - 1
+            r.iloc[-1] -= fee
+        r.iloc[0] -= fee
+        daily += (slot * r).reindex(days).fillna(0.0)
+        expo += slot * pd.Series(1.0, index=r.index).reindex(days).fillna(0.0)
+    equity = (1 + daily).cumprod()
+    b = bench.loc[days]
+    return equity, b / b.iloc[0], float(expo.mean())
+
+
+def curve_metrics(eq):
+    years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9)
+    total = float(eq.iloc[-1] / eq.iloc[0] - 1)
+    cagr = float((eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1)
+    mdd = float((eq / eq.cummax() - 1).min())
+    return total, cagr, mdd
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def run_backtest(p):
     data = load_data()
     ctx = build_ctx(data["gspc"], data["vix"], data["tnx"])
     last_date = max(df.index[-1] for df in data["stocks"].values())
-    start_date = last_date - pd.DateOffset(years=3)
+    start_date = last_date - pd.DateOffset(years=p["years"])
 
     cands = []
     for t, df in data["stocks"].items():
@@ -329,7 +373,7 @@ def run_backtest(p):
             cands.append(tr)
 
     cands.sort(key=lambda x: (x["signal_date"], x["ticker"]))
-    busy_t, busy_s, trades, missed = {}, {}, [], 0
+    busy_t, busy_s, open_ends, trades, missed, capped = {}, {}, [], [], 0, 0
     for tr in cands:
         t, s = tr["ticker"], tr["sector"]
         if tr["status"] == "MISSED":
@@ -338,18 +382,32 @@ def run_backtest(p):
             continue
         if tr["entry_date"] <= busy_t.get(t, pd.Timestamp.min) or tr["entry_date"] <= busy_s.get(s, pd.Timestamp.min):
             continue    # 같은 종목/같은 섹터 보유 중이면 신규 진입 불가
+        if sum(1 for e in open_ends if e > tr["entry_date"]) >= p["max_pos"]:
+            capped += 1
+            continue    # 동시 보유 종목 수 한도 초과
         end = tr["exit_date"] if tr["reason"] != "보유중" else pd.Timestamp.max
         busy_t[t] = end
         busy_s[s] = end
+        open_ends.append(end)
         trades.append(tr)
 
     df_tr = pd.DataFrame(trades)
-    return {"trades": df_tr, "missed": missed, "start": start_date, "end": last_date}
+    out = {"trades": df_tr, "missed": missed, "capped": capped, "start": start_date, "end": last_date,
+           "curve": None}
+    if len(df_tr) and "spy" in data and len(data["spy"]):
+        try:
+            eq, bench, expo = portfolio_curve(df_tr, data["stocks"], data["spy"], start_date, last_date, p)
+            out["curve"] = {"eq": eq, "bench": bench, "expo": expo,
+                            "strat": curve_metrics(eq), "spy": curve_metrics(bench)}
+        except Exception as e:
+            out["curve_err"] = str(e)
+    return out
 
 
 def summarize(df_tr):
     closed = df_tr[df_tr["reason"] != "보유중"]
-    out = {"n_closed": len(closed), "n_open": int((df_tr["reason"] == "보유중").sum())}
+    out = {"n_closed": len(closed), "n_open": int((df_tr["reason"] == "보유중").sum()),
+           "win_all": float((df_tr["net"] > 0).mean()), "avg_all": float(df_tr["net"].mean())}
     if len(closed) == 0:
         return out
     out.update({
@@ -391,10 +449,12 @@ with st.expander("⚙️ 필터 설정 (기본값 그대로 써도 됩니다)"):
         stop = st.slider("손절 (%)", 10, 40, 25)
         max_hold = st.slider("최대 보유일 (백테스트)", 60, 500, 250, 10)
         fee = st.number_input("편도 수수료 (%) — 증권사별 상이, 직접 확인", value=0.25, step=0.05)
+        years = st.selectbox("백테스트 기간 (년) — 길수록 하락장 포함", [3, 5, 8, 10], index=3)
+        max_pos = st.slider("동시 보유 최대 종목 수 (종목당 자금 = 1/N)", 3, 20, 10)
 
 P = {"drop": drop, "rsi": rsi, "use_bb": use_bb, "use_mkt": use_mkt, "use_rate": use_rate,
      "rate_thr": rate_thr, "limit_pct": limit_pct, "target": target, "stop": stop,
-     "max_hold": max_hold, "fee": fee}
+     "max_hold": max_hold, "fee": fee, "years": years, "max_pos": max_pos}
 
 # ------------------------------------------------------------------------------
 # 한눈에 결론 (설정 안 건드려도 이것만 보면 됨)
@@ -447,11 +507,20 @@ with verdict_box:
             tr0 = bt0["trades"]
             sm0 = summarize(tr0) if tr0 is not None and len(tr0) else {"n_closed": 0}
             if sm0["n_closed"] > 0:
-                st.caption(f"📊 이 규칙을 과거 3년에 적용하면: 청산 {sm0['n_closed']}건, 승률 {sm0['win'] * 100:.0f}%, "
-                           f"평균 {sm0['avg'] * 100:+.1f}% (수수료 반영, 세금·환율 제외, 생존자 편향으로 과대평가 가능)"
-                           + (" — ⚠️ 표본 30건 미만이라 신뢰도 낮음" if sm0["n_closed"] < 30 else ""))
+                line = (f"📊 이 규칙을 과거 {P['years']}년에 적용하면: 청산 {sm0['n_closed']}건, 승률 {sm0['win'] * 100:.0f}%, "
+                        f"평균 {sm0['avg'] * 100:+.1f}%")
+                cv = bt0.get("curve")
+                if cv:
+                    st_t, st_c, st_m = cv["strat"]
+                    sp_t, sp_c, sp_m = cv["spy"]
+                    line += (f" | 포트폴리오 연환산 {st_c * 100:+.1f}% vs S&P500(SPY) {sp_c * 100:+.1f}%, "
+                             f"최대낙폭 {st_m * 100:.0f}% vs {sp_m * 100:.0f}%")
+                line += " (수수료 반영, 세금·환율 제외, 생존자 편향으로 과대평가 가능)"
+                if sm0["n_closed"] < 30:
+                    line += " — ⚠️ 표본 30건 미만이라 신뢰도 낮음"
+                st.caption(line)
             else:
-                st.caption("📊 과거 3년 백테스트에서 청산 완료 거래가 없어 이 규칙의 성과는 확인되지 않았습니다.")
+                st.caption(f"📊 과거 {P['years']}년 백테스트에서 청산 완료 거래가 없어 이 규칙의 성과는 확인되지 않았습니다.")
         except Exception:
             pass
         st.caption(f"기준 데이터: {v['asof'].date()} 종가 · 투자 권유가 아닌 규칙 기반 참고 신호입니다.")
@@ -617,7 +686,7 @@ with tab2:
 # 탭 3
 # ------------------------------------------------------------------------------
 with tab3:
-    st.subheader("📊 과거 3년 실계산 백테스트")
+    st.subheader(f"📊 과거 {P['years']}년 실계산 백테스트 (기간은 ⚙️ 설정에서 변경)")
     st.markdown(
         "- 신호일 종가 기준 → **다음날 시가가 지정가 상한 이하일 때만 체결**\n"
         "- 체결 후 목표 익절 / 손절 / 최대 보유일 중 먼저 오는 쪽으로 청산 (같은 날 동시 도달 시 손절 우선)\n"
@@ -637,7 +706,8 @@ with tab3:
                 bt = None
                 st.error(f"백테스트 실패: {e}")
         if bt is not None:
-            st.caption(f"기간: {bt['start'].date()} ~ {bt['end'].date()} | 지정가 상한 초과로 미체결된 신호일: {bt['missed']}건")
+            st.caption(f"기간: {bt['start'].date()} ~ {bt['end'].date()} | 지정가 상한 초과로 미체결된 신호일: {bt['missed']}건 | "
+                       f"동시 보유 한도({P['max_pos']}종목) 초과로 건너뛴 신호: {bt.get('capped', 0)}건")
             tr = bt["trades"]
             if tr is None or len(tr) == 0:
                 st.info("이 설정에서는 체결된 거래가 0건입니다. 필터를 완화해 보세요 (볼린저 필수 해제, 하락 기준 완화 등).")
@@ -665,6 +735,37 @@ with tab3:
                         평균수익률=("net", lambda s: f"{s.mean() * 100:+.1f}%")).reset_index()
                     st.markdown("**VIX 공포 구간 vs 일반 구간 (VIX 30 이상 '강화 신호' 가설 검증)**")
                     st.dataframe(vsplit, hide_index=True)
+
+                    if sm["n_open"] > 0:
+                        st.caption(f"보유중 {sm['n_open']}건을 현재 평가손익으로 포함하면: 승률 {sm['win_all'] * 100:.1f}%, 평균 {sm['avg_all'] * 100:+.1f}% "
+                                   "(아직 확정 아님)")
+
+                    cv = bt.get("curve")
+                    st.markdown("**포트폴리오 vs S&P500 보유(SPY, 배당 포함)**")
+                    if cv:
+                        rows = []
+                        for name, m in (("이 전략", cv["strat"]), ("SPY 보유", cv["spy"])):
+                            rows.append({"구분": name, "총수익": f"{m[0] * 100:+.1f}%",
+                                         "연환산": f"{m[1] * 100:+.1f}%", "최대낙폭": f"{m[2] * 100:.1f}%"})
+                        st.dataframe(pd.DataFrame(rows), hide_index=True)
+                        st.caption(f"종목당 자금 1/{P['max_pos']}, 평균 투자 비중 {cv['expo'] * 100:.0f}% (나머지는 현금, 수익 0% 가정). "
+                                   "일별 평가 기준 근사치이며 세금·환율 제외.")
+                        st.line_chart(pd.DataFrame({"이 전략": cv["eq"], "SPY 보유": cv["bench"]}))
+                        beat_ret = cv["strat"][1] > cv["spy"][1]
+                        beat_dd = cv["strat"][2] > cv["spy"][2]
+                        st.markdown(f"- 연환산 수익이 지수보다 {'✅ 높음' if beat_ret else '❌ 낮음'}\n"
+                                    f"- 최대 낙폭이 지수보다 {'✅ 작음' if beat_dd else '❌ 큼'}")
+                    else:
+                        st.info(f"지수 비교 곡선을 만들지 못했습니다. {bt.get('curve_err', '')}")
+
+                    cl = closed.copy()
+                    cl["진입연도"] = cl["entry_date"].dt.year
+                    ysplit = cl.groupby("진입연도").agg(
+                        거래수=("net", "size"), 승률=("net", lambda s_: f"{(s_ > 0).mean() * 100:.0f}%"),
+                        평균수익률=("net", lambda s_: f"{s_.mean() * 100:+.1f}%"),
+                        손절=("reason", lambda s_: int((s_ == "손절").sum()))).reset_index()
+                    st.markdown("**연도별 성과 (하락장·상승장에서 흔들리는지 확인)**")
+                    st.dataframe(ysplit, hide_index=True)
 
                 show = tr.copy()
                 show["진입일"] = show["entry_date"].dt.date
